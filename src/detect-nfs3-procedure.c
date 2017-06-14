@@ -110,6 +110,9 @@ void DetectNfs3ProcedureRegister (void)
     DetectAppLayerInspectEngineRegister("nfs3_request",
             ALPROTO_NFS3, SIG_FLAG_TOSERVER, 0,
             DetectEngineInspectNfs3RequestGeneric);
+    DetectAppLayerInspectEngineRegister("nfs3_request",
+            ALPROTO_NFS, SIG_FLAG_TOSERVER, 0,
+            DetectEngineInspectNfs3RequestGeneric);
 
     g_nfs3_request_buffer_id = DetectBufferTypeGetByName("nfs3_request");
 
@@ -344,7 +347,7 @@ static int DetectNfs3ProcedureSetup (DetectEngineCtx *de_ctx, Signature *s,
 
     SCLogDebug("\'%s\'", rawstr);
 
-    if (DetectSignatureSetAppProto(s, ALPROTO_NFS3) != 0)
+    if (DetectSignatureSetAppProto(s, ALPROTO_NFS) != 0)
         return -1;
 
     dd = DetectNfs3ProcedureParse(rawstr);

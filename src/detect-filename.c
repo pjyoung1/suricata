@@ -85,6 +85,18 @@ void DetectFilenameRegister(void)
             DetectFileInspectGeneric);
 
     DetectAppLayerInspectEngineRegister("files",
+            ALPROTO_NFS, SIG_FLAG_TOSERVER, 0,
+            DetectFileInspectGeneric);
+    DetectAppLayerInspectEngineRegister("files",
+            ALPROTO_NFS, SIG_FLAG_TOCLIENT, 0,
+            DetectFileInspectGeneric);
+    DetectAppLayerInspectEngineRegister("files",
+            ALPROTO_NFS2, SIG_FLAG_TOSERVER, 0,
+            DetectFileInspectGeneric);
+    DetectAppLayerInspectEngineRegister("files",
+            ALPROTO_NFS2, SIG_FLAG_TOCLIENT, 0,
+            DetectFileInspectGeneric);
+    DetectAppLayerInspectEngineRegister("files",
             ALPROTO_NFS3, SIG_FLAG_TOSERVER, 0,
             DetectFileInspectGeneric);
     DetectAppLayerInspectEngineRegister("files",

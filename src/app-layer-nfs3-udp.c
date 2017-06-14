@@ -276,10 +276,8 @@ static FileContainer *NFS3GetFiles(void *state, uint8_t direction)
 static StreamingBufferConfig sbcfg = STREAMING_BUFFER_CONFIG_INITIALIZER;
 static SuricataFileContext sfc = { &sbcfg };
 
-void RegisterNFS3UDPParsers(void)
+static void RegisterNFS3UDPParser(const char *proto_name, AppProto alproto)
 {
-    const char *proto_name = "nfs3";
-
     /* Check if NFS3 TCP detection is enabled. If it does not exist in
      * the configuration file then it will be enabled by default. */
     if (AppLayerProtoDetectConfProtoDetectionEnabled("udp", proto_name)) {
@@ -288,26 +286,26 @@ void RegisterNFS3UDPParsers(void)
 
         SCLogDebug("NFS3 UDP protocol detection enabled.");
 
-        AppLayerProtoDetectRegisterProtocol(ALPROTO_NFS3, proto_name);
+        AppLayerProtoDetectRegisterProtocol(alproto, proto_name);
 
         if (RunmodeIsUnittests()) {
 
             SCLogDebug("Unittest mode, registering default configuration.");
             AppLayerProtoDetectPPRegister(IPPROTO_UDP, NFS3_DEFAULT_PORT,
-                ALPROTO_NFS3, 0, NFS3_MIN_FRAME_LEN, STREAM_TOSERVER,
+                alproto, 0, NFS3_MIN_FRAME_LEN, STREAM_TOSERVER,
                 NFS3ProbingParserTS, NFS3ProbingParserTC);
 
         }
         else {
 
             if (!AppLayerProtoDetectPPParseConfPorts("udp", IPPROTO_UDP,
-                    proto_name, ALPROTO_NFS3, 0, NFS3_MIN_FRAME_LEN,
+                    proto_name, alproto, 0, NFS3_MIN_FRAME_LEN,
                     NFS3ProbingParserTS, NFS3ProbingParserTC)) {
                 SCLogDebug("No NFS3 app-layer configuration, enabling NFS3"
                     " detection TCP detection on port %s.",
                     NFS3_DEFAULT_PORT);
                 AppLayerProtoDetectPPRegister(IPPROTO_UDP,
-                    NFS3_DEFAULT_PORT, ALPROTO_NFS3, 0,
+                    NFS3_DEFAULT_PORT, alproto, 0,
                     NFS3_MIN_FRAME_LEN, STREAM_TOSERVER,
                     NFS3ProbingParserTS, NFS3ProbingParserTC);
             }
@@ -327,55 +325,62 @@ void RegisterNFS3UDPParsers(void)
 
         /* Register functions for state allocation and freeing. A
          * state is allocated for every new NFS3 flow. */
-        AppLayerParserRegisterStateFuncs(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterStateFuncs(IPPROTO_UDP, alproto,
             NFS3StateAlloc, NFS3StateFree);
 
         /* Register request parser for parsing frame from server to client. */
-        AppLayerParserRegisterParser(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterParser(IPPROTO_UDP, alproto,
             STREAM_TOSERVER, NFS3ParseRequest);
 
         /* Register response parser for parsing frames from server to client. */
-        AppLayerParserRegisterParser(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterParser(IPPROTO_UDP, alproto,
             STREAM_TOCLIENT, NFS3ParseResponse);
 
         /* Register a function to be called by the application layer
          * when a transaction is to be freed. */
-        AppLayerParserRegisterTxFreeFunc(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterTxFreeFunc(IPPROTO_UDP, alproto,
             NFS3StateTxFree);
 
-        AppLayerParserRegisterLoggerFuncs(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterLoggerFuncs(IPPROTO_UDP, alproto,
             NFS3GetTxLogged, NFS3SetTxLogged);
 
         /* Register a function to return the current transaction count. */
-        AppLayerParserRegisterGetTxCnt(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterGetTxCnt(IPPROTO_UDP, alproto,
             NFS3GetTxCnt);
 
         /* Transaction handling. */
-        AppLayerParserRegisterGetStateProgressCompletionStatus(ALPROTO_NFS3,
+        AppLayerParserRegisterGetStateProgressCompletionStatus(alproto,
             NFS3GetAlstateProgressCompletionStatus);
         AppLayerParserRegisterGetStateProgressFunc(IPPROTO_UDP,
-            ALPROTO_NFS3, NFS3GetStateProgress);
-        AppLayerParserRegisterGetTx(IPPROTO_UDP, ALPROTO_NFS3,
+            alproto, NFS3GetStateProgress);
+        AppLayerParserRegisterGetTx(IPPROTO_UDP, alproto,
             NFS3GetTx);
 
-        AppLayerParserRegisterGetFilesFunc(IPPROTO_UDP, ALPROTO_NFS3, NFS3GetFiles);
+        AppLayerParserRegisterGetFilesFunc(IPPROTO_UDP, alproto, NFS3GetFiles);
 
         /* Application layer event handling. */
-//        AppLayerParserRegisterHasEventsFunc(IPPROTO_UDP, ALPROTO_NFS3,
+//        AppLayerParserRegisterHasEventsFunc(IPPROTO_UDP, alproto,
 //            NFS3HasEvents);
 
         /* What is this being registered for? */
-        AppLayerParserRegisterDetectStateFuncs(IPPROTO_UDP, ALPROTO_NFS3,
+        AppLayerParserRegisterDetectStateFuncs(IPPROTO_UDP, alproto,
             NULL, NFS3GetTxDetectState, NFS3SetTxDetectState);
 
-//        AppLayerParserRegisterGetEventInfo(IPPROTO_UDP, ALPROTO_NFS3,
+//        AppLayerParserRegisterGetEventInfo(IPPROTO_UDP, alproto,
 //            NFS3StateGetEventInfo);
-//        AppLayerParserRegisterGetEventsFunc(IPPROTO_UDP, ALPROTO_NFS3,
+//        AppLayerParserRegisterGetEventsFunc(IPPROTO_UDP, alproto,
 //            NFS3GetEvents);
     }
     else {
         SCLogNotice("NFS3 protocol parsing disabled.");
     }
+
+}
+
+void RegisterNFS3UDPParsers(void)
+{
+    RegisterNFS3UDPParser("nfs3", ALPROTO_NFS3);
+    RegisterNFS3UDPParser("nfs2", ALPROTO_NFS2);
 
 #ifdef UNITTESTS
     AppLayerParserRegisterProtocolUnittests(IPPROTO_UDP, ALPROTO_NFS3,

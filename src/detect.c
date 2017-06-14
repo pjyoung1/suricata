@@ -1192,6 +1192,11 @@ void SigMatchSignatures(ThreadVars *th_v, DetectEngineCtx *de_ctx, DetectEngineT
                         SCLogDebug("DCERPC sig, alproto not SMB or SMB2");
                         goto next;
                     }
+                } else if (s->alproto == ALPROTO_NFS) {
+                    if (alproto != ALPROTO_NFS2 && alproto != ALPROTO_NFS3) {
+                        SCLogDebug("NFS sig, alproto not NFSv2 or NFSv3");
+                        goto next;
+                    }
                 } else {
                     SCLogDebug("alproto mismatch");
                     goto next;

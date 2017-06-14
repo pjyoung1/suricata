@@ -44,6 +44,8 @@ enum AppProtoEnum {
     ALPROTO_MODBUS,
     ALPROTO_ENIP,
     ALPROTO_DNP3,
+    ALPROTO_NFS,    /* for in rules */
+    ALPROTO_NFS2,
     ALPROTO_NFS3,
     ALPROTO_TEMPLATE,
 

@@ -839,6 +839,10 @@ static int SigParseProto(Signature *s, const char *protostr)
         if (s->alproto != ALPROTO_UNKNOWN) {
             s->flags |= SIG_FLAG_APPLAYER;
 
+            if (s->alproto == ALPROTO_NFS) {
+                s->proto.proto[IPPROTO_TCP / 8] |= 1 << (IPPROTO_TCP % 8);
+                s->proto.proto[IPPROTO_UDP / 8] |= 1 << (IPPROTO_UDP % 8);
+            }
             AppLayerProtoDetectSupportedIpprotos(s->alproto, s->proto.proto);
         }
         else {
@@ -1269,6 +1273,12 @@ int DetectSignatureSetAppProto(Signature *s, AppProto alproto)
         return -1;
     }
 
+    if (alproto == ALPROTO_NFS &&
+            (s->alproto == ALPROTO_NFS2 || s->alproto == ALPROTO_NFS3)) {
+        SCLogDebug("keeping protocol as ALPROTO_NFS2 or ALPROTO_NFS3");
+        return 0;
+    }
+
     if (s->alproto != ALPROTO_UNKNOWN && s->alproto != alproto) {
         SCLogError(SC_ERR_CONFLICTING_RULE_KEYWORDS,
             "can't set rule app proto to %s: already set to %s",
@@ -1602,7 +1612,7 @@ static int SigValidate(DetectEngineCtx *de_ctx, Signature *s)
 #endif
 
     if ((s->flags & SIG_FLAG_FILESTORE) || s->file_flags != 0) {
-        if (s->alproto != ALPROTO_UNKNOWN &&
+        if (s->alproto != ALPROTO_UNKNOWN && s->alproto != ALPROTO_NFS &&
                 !AppLayerParserSupportsFiles(IPPROTO_TCP, s->alproto))
         {
             SCLogError(SC_ERR_NO_FILES_FOR_PROTOCOL, "protocol %s doesn't "
