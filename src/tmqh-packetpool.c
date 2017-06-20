@@ -493,7 +493,7 @@ void TmqhOutputPacketpool(ThreadVars *t, Packet *p)
                 SCLogDebug("p->root->tunnel_verdicted == 1 && TUNNEL_PKT_TPR(p) == 1");
                 /* the root is ready and we are the last tunnel packet,
                  * lets enqueue them both. */
-                TUNNEL_DECR_PKT_TPR_NOLOCK(p);
+                //TUNNEL_DECR_PKT_TPR_NOLOCK(p);
 
                 /* handle the root */
                 SCLogDebug("setting proot = 1 for root pkt, p->root %p "
@@ -507,7 +507,7 @@ void TmqhOutputPacketpool(ThreadVars *t, Packet *p)
                 SCLogDebug("NOT p->root->tunnel_verdicted == 1 && "
                         "TUNNEL_PKT_TPR(p) == 1 (%" PRIu32 ")", TUNNEL_PKT_TPR(p));
 
-                TUNNEL_DECR_PKT_TPR_NOLOCK(p);
+                //TUNNEL_DECR_PKT_TPR_NOLOCK(p);
 
                  /* fall through */
             }
