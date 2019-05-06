@@ -220,6 +220,10 @@ static int NapatechInit(int runmode)
         SCLogInfo("Host Buffer Allowance: %d", (int) conf->hba);
     }
 
+#ifdef NAPATECH_ENABLE_BYPASS
+    NapatechInitFlowStreams();
+#endif
+
     /* Start a thread to process the statistics */
     NapatechStartStats();
 

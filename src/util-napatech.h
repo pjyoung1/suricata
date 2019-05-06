@@ -32,6 +32,11 @@ typedef struct NapatechPacketVars_ {
     uint64_t stream_id;
     NtNetBuf_t nt_packet_buf;
     ThreadVars *tv;
+#ifdef NAPATECH_ENABLE_BYPASS
+    NtDyn3Descr_t *dyn3;
+    uint8_t key_IPv4;
+    uint8_t key_IPv6;
+#endif
 } NapatechPacketVars;
 
 typedef struct NapatechStreamConfig_ {
@@ -46,10 +51,13 @@ typedef struct NapatechCurrentStats_ {
     uint64_t current_bytes;
 } NapatechCurrentStats;
 
+#define MAX_HOSTBUFFER 4
 #define MAX_STREAMS 256
+#define MAX_PORTS 80
+#define MAX_ADAPTERS 8
+#define HB_HIGHWATER 2048 //1982
 
 extern void NapatechStartStats(void);
-
 
 #define NAPATECH_ERROR(err_type, status) {  \
     char errorBuffer[1024]; \
@@ -75,11 +83,35 @@ extern void NapatechStartStats(void);
                    "         %s", ntpl_info.u.errorData.errBuffer[2]); \
 }
 
+//#define ENABLE_NT_DEBUG
+#ifdef ENABLE_NT_DEBUG
+	void NapatechPrintIP(uint32_t address);
+
+	#define NAPATECH_DEBUG(...) printf(__VA_ARGS__)
+	#define NAPATECH_PRINTIP(a) NapatechPrintIP(uint32_t address)
+#else
+	#define NAPATECH_DEBUG(...)
+	#define NAPATECH_PRINTIP(a)
+#endif
 
 NapatechCurrentStats NapatechGetCurrentStats(uint16_t id);
 int NapatechGetStreamConfig(NapatechStreamConfig stream_config[]);
 bool NapatechSetupNuma(uint32_t stream, uint32_t numa);
 uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream, uint32_t *filter_id, uint32_t *hash_id);
 bool NapatechDeleteFilter(uint32_t filter_id);
+
+#ifdef NAPATECH_ENABLE_BYPASS
+
+#define NAPATECH_KEY_IPV4 3
+#define NAPATECH_KEY_IPV6 4
+#define NAPATECH_KEY_PASS 1
+#define NAPATECH_KEY_DROP 2
+
+int NapatechInitFlowStreams(void);
+NtFlowStream_t *NapatechGetFlowStreamPtr(int device);
+int NapatechCloseFlowStreams(void);
+
+#endif
+
 #endif //HAVE_NAPATECH
 #endif /* __UTIL_NAPATECH_H__ */

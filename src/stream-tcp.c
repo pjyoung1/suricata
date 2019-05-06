@@ -4845,6 +4845,7 @@ int StreamTcpPacket (ThreadVars *tv, Packet *p, StreamTcpThread *stt,
         {
             /* we can call bypass callback, if enabled */
             if (StreamTcpBypassEnabled()) {
+            	printf("PacketBypassCallback() - 1");
                 PacketBypassCallback(p);
             }
         }
@@ -4865,6 +4866,7 @@ int StreamTcpPacket (ThreadVars *tv, Packet *p, StreamTcpThread *stt,
         if (ssn->flags & STREAMTCP_FLAG_BYPASS) {
             /* we can call bypass callback, if enabled */
             if (StreamTcpBypassEnabled()) {
+            	printf("PacketBypassCallback() - 2");
                 PacketBypassCallback(p);
             }
 
@@ -4875,6 +4877,7 @@ int StreamTcpPacket (ThreadVars *tv, Packet *p, StreamTcpThread *stt,
                 StreamTcpBypassEnabled())
         {
             SCLogDebug("bypass as stream is dead and we have no rules");
+        	printf("PacketBypassCallback() - 3");
             PacketBypassCallback(p);
         }
     }

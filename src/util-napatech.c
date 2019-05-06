@@ -24,6 +24,8 @@
  *
  */
 
+
+
 #include "suricata-common.h"
 #ifdef HAVE_NAPATECH
 #include "suricata.h"
@@ -31,19 +33,282 @@
 #include "util-cpu.h"
 #include "threadvars.h"
 #include "tm-threads.h"
+#include "util-napatech.h"
+
+
+//#ifdef ENABLE_NT_DEBUG
+//void NapatechPrintIP(uint32_t address)
+//{
+//    printf("%i.%i.%i.%i",
+//            (address >> 24) & 0xff,
+//            (address >> 16) & 0xff,
+//            (address >> 8) & 0xff,
+//            address & 0xff);
+//}
+//#endif
+
+
+#ifdef NAPATECH_ENABLE_BYPASS
+
+typedef struct FlowStatsCounters_ {
+	uint16_t active_bypass_flows;
+	uint16_t total_bypass_flows;
+} FlowStatsCounters;
+
+typedef struct FlowInfoCounters_ {
+	uint16_t packets;
+	uint16_t bytes;
+	uint16_t to;
+	uint16_t fin;
+} FlowInfoCounters;
+
+static NtFlowStream_t hFlowStream[MAX_ADAPTERS];
+
+/**
+ * \brief  Returns the number of Napatech Adapters in the system.
+ *
+ * \return count of the Napatech adapters present in the system.
+ */
+static int getNumAdapters(void) {
+    NtInfoStream_t hInfo;
+    NtInfo_t hInfoSys;
+    int status;
+
+    if ((status = NT_InfoOpen(&hInfo, "InfoStream")) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_OPEN_FAILED, status);
+        exit(EXIT_FAILURE);
+    }
+
+    hInfoSys.cmd = NT_INFO_CMD_READ_SYSTEM;
+    if ((status = NT_InfoRead(hInfo, &hInfoSys)) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_OPEN_FAILED, status);
+       exit(EXIT_FAILURE);
+    }
+
+    int num_adapters = hInfoSys.u.system.data.numAdapters;
+
+    NT_InfoClose(hInfo);
+    return num_adapters;
+}
+
+/**
+ * \brief  Initializes the FlowStreams used to program flow data.
+ *
+ * Opens a FlowStream on each adapter present in the system.  This
+ * FlowStream is subsequently used to program the adapter with
+ * flows to bypass.
+ *
+ * \return count of the Napatech adapters present in the system.
+ */
+int NapatechInitFlowStreams(void)
+{
+    int status;
+	int adapter = 0;
+	int num_adapters = getNumAdapters();
+    memset(&hFlowStream, 0, sizeof(hFlowStream));
+
+	for (adapter = 0; adapter < num_adapters; ++adapter) {
+		NtFlowAttr_t attr;
+		char flow_name[80];
+
+		NT_FlowOpenAttrInit(&attr);
+		NT_FlowOpenAttrSetAdapterNo(&attr, adapter);
+        NT_FlowOpenAttrSetFlags(&attr, NT_FLOW_STREAM_WR);
+
+        snprintf(flow_name, sizeof(flow_name), "Flow stream %d", adapter );
+        if ((status = NT_FlowOpen_Attr(&hFlowStream[adapter], flow_name, &attr)) != NT_SUCCESS) {
+			NAPATECH_ERROR(SC_ERR_NAPATECH_OPEN_FAILED, status);
+            exit(EXIT_FAILURE);
+        }
+	}
+
+	return num_adapters;
+}
+
+/**
+ * \brief  Returns a pointer to the FlowStream associated with this adapter.
+ *
+ * \return count of the Napatech adapters present in the system.
+ */
+NtFlowStream_t *NapatechGetFlowStreamPtr(int device)
+{
+	return & hFlowStream[device];
+}
+
+/**
+ * \brief Closes all open FlowStreams
+ *
+ * \return Success of the operation.
+ */
+int NapatechCloseFlowStreams(void)
+{
+    int status = 0;
+	int adapter = 0;
+	int num_adapters = getNumAdapters();
+
+	for (adapter = 0; adapter < num_adapters; ++adapter) {
+		if (hFlowStream[adapter]) {
+		    SCLogInfo("Closing Napatech Flow Stream on adapter %d.", adapter);
+			if ((status = NT_FlowClose(hFlowStream[adapter])) != NT_SUCCESS) {
+				NAPATECH_ERROR(SC_ERR_SHUTDOWN, status);
+			}
+			hFlowStream[adapter] = NULL;
+		}
+	}
+	return (status == NT_SUCCESS);
+}
+
+
+/**
+ * \brief  Updates statistic counters for Napatech FlowStats
+ *
+ * \param tv     Thread variable to ThreadVars
+ * \param hInfo  Handle to the Napatech InfoStream.
+ * \param hstat_stream  Handle to the Napatech Statistics Stream.
+ * \param flow_counters The flow counters statistics to update.
+ *
+ * \param data      data pointer gets populated with
+ *
+ */
+static void UpdateFlowStats(
+		ThreadVars *tv,
+        NtInfoStream_t hInfo,
+        NtStatStream_t hstat_stream,
+		FlowStatsCounters flow_counters
+        )
+{
+	NtStatistics_t hStat;
+    int status;
+
+		hStat.cmd = NT_STATISTICS_READ_CMD_FLOW_V0;
+		hStat.u.flowData_v0.clear = 0;
+		hStat.u.flowData_v0.adapterNo = 0;
+		if ((status = NT_StatRead(hstat_stream, &hStat)) != NT_SUCCESS) {
+			NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
+			exit(1);
+		}
+		uint64_t programed = hStat.u.flowData_v0.learnDone;
+		uint64_t removed = hStat.u.flowData_v0.unlearnDone
+				+ hStat.u.flowData_v0.automaticUnlearnDone
+				+ hStat.u.flowData_v0.timeoutUnlearnDone;
+
+        StatsSetUI64(tv, flow_counters.active_bypass_flows, programed - removed);
+        StatsSetUI64(tv, flow_counters.total_bypass_flows, programed);
+}
+
+
+
+/**
+ * \brief  Thread Loop for processing FlowInfo records as they are generated
+ *
+ * \param arg   Value that is caste to a ThreadVars structure
+ *
+ */
+
+
+static void *NapatechFlowInfoLoop(void *arg)
+{
+    int status;
+	NtFlowStream_t hFlowStream;
+	NtFlowInfo_t flow_info;
+	NtFlowAttr_t attr;
+	uint64_t pkt_cnt = 0;
+	uint64_t byte_cnt = 0;
+	uint64_t to_cnt = 0;
+	uint64_t fin_cnt = 0;
+
+    SCLogInfo("starting Napatech FlowInfoLoop...");
+
+    ThreadVars *tv = (ThreadVars *) arg;
+
+	uint32_t adapter = 0; //_get_adapter(*port);
+
+    FlowInfoCounters flowinfo_counters;
+    flowinfo_counters.packets = StatsRegisterCounter("nt_bypass.pkts", tv);
+    flowinfo_counters.bytes = StatsRegisterCounter("nt_bypass.bytes", tv);
+    flowinfo_counters.to = StatsRegisterCounter("nt_bypass.to", tv);
+    flowinfo_counters.fin = StatsRegisterCounter("nt_bypass.fin", tv);
+
+    StatsSetupPrivate(tv);
+
+	NT_FlowOpenAttrInit(&attr);
+	NT_FlowOpenAttrSetAdapterNo(&attr, adapter);
+	NT_FlowOpenAttrSetFlags(&attr, NT_FLOW_STREAM_RD);
+
+	if ((status = NT_FlowOpen_Attr(&hFlowStream, "FlowInfo stream", &attr)) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
+		return NULL;
+	}
+
+    TmThreadsSetFlag(tv, THV_INIT_DONE);
+	while (1) {
+        if (TmThreadsCheckFlag(tv, THV_KILL)) {
+            SCLogDebug("NapatechStatsLoop THV_KILL detected");
+            break;
+        }
+		status = NT_FlowRead(hFlowStream, &flow_info, 1000);
+		if (status == NT_SUCCESS) {
+
+			pkt_cnt += flow_info.packets_a + flow_info.packets_b;
+			byte_cnt += flow_info.octets_a + flow_info.octets_b;
+			switch (flow_info.cause) {
+				case 1: ++to_cnt;
+					break;
+				case 2: ++fin_cnt;
+					break;
+				default:
+					break;
+			}
+
+			NAPATECH_DEBUG("--- id: 0x%08x - pkts_a: %5ld  pkts_b: %5ld  total: %ld  cause: %s(%d) --  to: %ld  fin: %ld\n",
+					flow_info.id,
+					flow_info.packets_a, flow_info.packets_b,
+					pkt_cnt,
+					(flow_info.cause == 1 ? "to" : (flow_info.cause == 2) ? "fin" : " sw"),
+					flow_info.cause,
+					to_cnt, fin_cnt
+					);
+		} else {
+			if (status != NT_STATUS_TIMEOUT) {
+				NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
+			}
+		}
+
+		StatsSetUI64(tv, flowinfo_counters.packets, pkt_cnt);
+		StatsSetUI64(tv, flowinfo_counters.bytes, byte_cnt);
+		StatsSetUI64(tv, flowinfo_counters.to, to_cnt);
+		StatsSetUI64(tv, flowinfo_counters.fin, fin_cnt);
+
+		StatsSyncCountersIfSignalled(tv);
+
+	} // while
+
+	if ((status = NT_FlowClose(hFlowStream)) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
+	}
+	SCLogInfo("FlowInfo thread terminating.");
+
+    TmThreadsSetFlag(tv, THV_RUNNING_DONE);
+    TmThreadWaitForFlag(tv, THV_DEINIT);
+    TmThreadsSetFlag(tv, THV_CLOSED);
+
+    return NULL;
+}
+
+
+#endif
+
 
 /*-----------------------------------------------------------------------------
  *-----------------------------------------------------------------------------
  * Statistics code
  *-----------------------------------------------------------------------------
  */
-
 typedef struct StreamCounters_ {
     uint16_t pkts;
     uint16_t byte;
     uint16_t drop;
 } StreamCounters;
-
 
 NapatechCurrentStats current_stats[MAX_STREAMS];
 
@@ -61,18 +326,26 @@ enum CONFIG_SPECIFIER {
 
 #define MAX_HOSTBUFFERS 8
 
+/**
+ * \brief  Test to see if any of the configured streams are active
+ *
+ * \hInfo Handle to Napatech Info Stream.
+ * \hStatsStream Handle to Napatech Statistics stream
+ * \stream_config array of stream configuration structures
+ * \num_inst
+ * \param arg   Value that is caste to a ThreadVars structure
+ *
+ */
 static uint16_t TestStreamConfig(
         NtInfoStream_t hInfo,
-        NtStatStream_t hStatStream,
+        NtStatStream_t hstat_stream,
         NapatechStreamConfig stream_config[],
         uint16_t num_inst)
 {
-
     uint16_t num_active = 0;
 
     for (uint16_t inst = 0; inst < num_inst; ++inst) {
         int status;
-        char buffer[80]; // Error buffer
         NtStatistics_t stat; // Stat handle.
 
         /* Check to see if it is an active stream */
@@ -82,11 +355,8 @@ static uint16_t TestStreamConfig(
         stat.cmd = NT_STATISTICS_READ_CMD_USAGE_DATA_V0;
         stat.u.usageData_v0.streamid = (uint8_t) stream_config[inst].stream_id;
 
-        if ((status = NT_StatRead(hStatStream, &stat)) != NT_SUCCESS) {
-            /* Get the status code as text */
-            NT_ExplainError(status, buffer, sizeof (buffer));
-            SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                    "NT_StatRead():2 failed: %s\n", buffer);
+        if ((status = NT_StatRead(hstat_stream, &stat)) != NT_SUCCESS) {
+			NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
             return 0;
         }
 
@@ -101,9 +371,21 @@ static uint16_t TestStreamConfig(
     return num_active;
 }
 
+/**
+ * \brief  Updates Napatech packet counters
+ *
+ * \tv Pointer to TheardVars structure
+ * \hInfo Handle to Napatech Info Stream.
+ * \hStatsStream Handle to Napatech Statistics stream
+ * \num_streams the number of streams that are currently active
+ * \stream_config array of stream configuration structures
+ * \streamCounters the packet counters to be updated.
+ * \param arg   Value that is caste to a ThreadVars structure
+ *
+ */
 static uint32_t UpdateStreamStats(ThreadVars *tv,
         NtInfoStream_t hInfo,
-        NtStatStream_t hStatStream,
+        NtStatStream_t hstat_stream,
         uint16_t num_streams,
         NapatechStreamConfig stream_config[],
         StreamCounters streamCounters[]
@@ -114,21 +396,18 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
     static uint64_t dropStart[MAX_STREAMS] = {0};
 
     int status;
-    char error_buffer[80]; // Error buffer
     NtInfo_t hStreamInfo;
     NtStatistics_t hStat; // Stat handle.
 
     /* Query the system to get the number of streams currently instantiated */
     hStreamInfo.cmd = NT_INFO_CMD_READ_STREAM;
     if ((status = NT_InfoRead(hInfo, &hStreamInfo)) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                "NT_InfoRead() failed: %s\n", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
 
     uint16_t num_active;
-    if ((num_active = TestStreamConfig(hInfo, hStatStream,
+    if ((num_active = TestStreamConfig(hInfo, hstat_stream,
             stream_config, num_streams)) == 0) {
         /* None of the configured streams are active */
         return 0;
@@ -138,8 +417,6 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
     uint16_t inst_id = 0;
     uint32_t stream_cnt = 0;
     for (stream_cnt = 0; stream_cnt < num_streams; ++stream_cnt) {
-
-
         while (inst_id < num_streams) {
             if (stream_config[inst_id].is_active) {
                 break;
@@ -155,11 +432,8 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
         hStat.cmd = NT_STATISTICS_READ_CMD_USAGE_DATA_V0;
         hStat.u.usageData_v0.streamid = (uint8_t) stream_config[inst_id].stream_id;
 
-        if ((status = NT_StatRead(hStatStream, &hStat)) != NT_SUCCESS) {
-            /* Get the status code as text */
-            NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-            SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                    "NT_StatRead() failed: %s\n", error_buffer);
+        if ((status = NT_StatRead(hstat_stream, &hStat)) != NT_SUCCESS) {
+			NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
             return 0;
         }
 
@@ -196,29 +470,33 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
     return num_active;
 }
 
+/**
+ * \brief Statistics processing loop
+ *
+ * Instantiated on the stats thread.  Periodically retrieives
+ * statistics from the Napatech card and updates the packet counters
+ *
+ * \param arg Pointer that is caste into a TheardVars structure
+ */
 static void *NapatechStatsLoop(void *arg)
 {
     ThreadVars *tv = (ThreadVars *) arg;
 
     int status;
-    char error_buffer[80]; // Error buffer
     NtInfoStream_t hInfo;
-    NtStatStream_t hStatStream;
+    NtStatStream_t hstat_stream;
 
     NapatechStreamConfig stream_config[MAX_STREAMS];
     uint16_t stream_cnt = NapatechGetStreamConfig(stream_config);
 
     /* Open the info and Statistics */
     if ((status = NT_InfoOpen(&hInfo, "StatsLoopInfoStream")) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_RUNMODE, "NT_InfoOpen() failed: %s\n", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         return NULL;
     }
 
-    if ((status = NT_StatOpen(&hStatStream, "StatsLoopStatsStream")) != NT_SUCCESS) {
-        /* Get the status code as text */
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-        SCLogError(SC_ERR_RUNMODE, "NT_StatOpen() failed: %s\n", error_buffer);
+    if ((status = NT_StatOpen(&hstat_stream, "StatsLoopStatsStream")) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         return NULL;
     }
 
@@ -253,6 +531,12 @@ static void *NapatechStatsLoop(void *arg)
         streamCounters[i].drop = StatsRegisterCounter(drop_buf, tv);
     }
 
+#ifdef NAPATECH_ENABLE_BYPASS
+    FlowStatsCounters flow_counters;
+	flow_counters.active_bypass_flows = StatsRegisterCounter("nt_bypass.active_flows", tv);
+	flow_counters.total_bypass_flows = StatsRegisterCounter("nt_bypass.total_flows", tv);
+#endif
+
     StatsSetupPrivate(tv);
 
     for (int i = 0; i < stream_cnt; ++i) {
@@ -261,7 +545,13 @@ static void *NapatechStatsLoop(void *arg)
         StatsSetUI64(tv, streamCounters[i].drop, 0);
     }
 
-    uint32_t num_active = UpdateStreamStats(tv, hInfo, hStatStream,
+#ifdef NAPATECH_ENABLE_BYPASS
+    StatsSetUI64(tv, flow_counters.active_bypass_flows, 0);
+    StatsSetUI64(tv, flow_counters.total_bypass_flows, 0);
+    UpdateFlowStats(tv, hInfo, hstat_stream, flow_counters);
+#endif
+
+    uint32_t num_active = UpdateStreamStats(tv, hInfo, hstat_stream,
             stream_cnt, stream_config, streamCounters);
 
     if (!NapatechIsAutoConfigEnabled() && (num_active < stream_cnt)) {
@@ -277,8 +567,12 @@ static void *NapatechStatsLoop(void *arg)
             break;
         }
 
-        UpdateStreamStats(tv, hInfo, hStatStream,
+        UpdateStreamStats(tv, hInfo, hstat_stream,
                 stream_cnt, stream_config, streamCounters);
+
+#ifdef NAPATECH_ENABLE_BYPASS
+        UpdateFlowStats(tv, hInfo, hstat_stream, flow_counters);
+#endif
 
         StatsSyncCountersIfSignalled(tv);
         usleep(1000000);
@@ -286,19 +580,15 @@ static void *NapatechStatsLoop(void *arg)
 
     /* CLEAN UP NT Resources and Close the info stream */
     if ((status = NT_InfoClose(hInfo)) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_RUNMODE, "NT_InfoClose() failed: %s\n", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         return NULL;
     }
 
     /* Close the statistics stream */
-    if ((status = NT_StatClose(hStatStream)) != NT_SUCCESS) {
-        /* Get the status code as text */
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-        SCLogError(SC_ERR_RUNMODE, "NT_StatClose() failed: %s\n", error_buffer);
+    if ((status = NT_StatClose(hstat_stream)) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         return NULL;
     }
-
 
     SCLogDebug("Exiting NapatechStatsLoop");
     TmThreadsSetFlag(tv, THV_RUNNING_DONE);
@@ -312,6 +602,13 @@ static void *NapatechStatsLoop(void *arg)
 #define MAX_STREAMS 256
 #define HB_HIGHWATER 2048 //1982
 
+/**
+ * \brief  Tests wheather a particular stream_id is actively registeed
+ *
+ * \stream_id - ID of the stream to look up
+ * \num_registered - The total number of registered streams
+ * \registered_streams - An array containing actively registered streams.
+ */
 static bool RegisteredStream(uint16_t stream_id, uint16_t num_registered,
         NapatechStreamConfig registered_streams[])
 {
@@ -323,6 +620,11 @@ static bool RegisteredStream(uint16_t stream_id, uint16_t num_registered,
     return false;
 }
 
+/**
+ * \brief Count the number of worker threads defined in the conf file.
+ *
+ * \return - The number of worker threads defined by the configuration
+ */
 static uint32_t CountWorkerThreads(void)
 {
     int worker_count = 0;
@@ -331,6 +633,7 @@ static uint32_t CountWorkerThreads(void)
     ConfNode *root = ConfGetNode("threading.cpu-affinity");
 
     if (root != NULL) {
+
         TAILQ_FOREACH(affinity, &root->head, next)
         {
             if (strcmp(affinity->val, "decode-cpu-set") == 0 ||
@@ -392,11 +695,19 @@ static uint32_t CountWorkerThreads(void)
     return worker_count;
 }
 
+/**
+ * \brief Reads and parses the stream configuration defined in the config file.
+ *
+ * \param stream_config - array to be filled in with active stream info.
+ *
+ * \return success or failure
+ *
+  */
 int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
 {
     int status;
     char error_buffer[80]; // Error buffer
-    NtStatStream_t hStatStream;
+    NtStatStream_t hstat_stream;
     NtStatistics_t hStat; // Stat handle.
     NtInfoStream_t info_stream;
     NtInfo_t info;
@@ -420,25 +731,19 @@ int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
     }
 
     if ((status = NT_InfoOpen(&info_stream, "SuricataStreamInfo")) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED,
-                "NT_InfoOpen failed: %s", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED, status);
         return -1;
     }
 
-    if ((status = NT_StatOpen(&hStatStream, "StatsStream")) != NT_SUCCESS) {
-        /* Get the status code as text */
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-        SCLogError(SC_ERR_RUNMODE, "NT_StatOpen() failed: %s\n", error_buffer);
+    if ((status = NT_StatOpen(&hstat_stream, "StatsStream")) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED, status);
         return -1;
     }
 
     if (use_all_streams) {
         info.cmd = NT_INFO_CMD_READ_STREAM;
         if ((status = NT_InfoRead(info_stream, &info)) != NT_SUCCESS) {
-            NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-            SCLogError(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED,
-                    "NT_InfoRead failed: %s", error_buffer);
+    		NAPATECH_ERROR(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED, status);
             return -1;
         }
 
@@ -456,7 +761,7 @@ int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
             hStat.cmd = NT_STATISTICS_READ_CMD_USAGE_DATA_V0;
             hStat.u.usageData_v0.streamid = (uint8_t) stream_id;
 
-            if ((status = NT_StatRead(hStatStream, &hStat)) != NT_SUCCESS) {
+            if ((status = NT_StatRead(hstat_stream, &hStat)) != NT_SUCCESS) {
                 /* Get the status code as text */
                 NT_ExplainError(status, error_buffer, sizeof (error_buffer));
                 SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
@@ -481,7 +786,7 @@ int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
             start = 0;
             end = CountWorkerThreads() - 1;
         } else {
-            /* When not using the default streams we need to
+            /* When not using the default streams we need to 
              * parse the array of streams from the conf */
             if ((ntstreams = ConfGetNode("napatech.streams")) == NULL) {
                 SCLogError(SC_ERR_RUNMODE,
@@ -502,7 +807,7 @@ int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
             {
 
                 if (stream == NULL) {
-                    SCLogError(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED,
+                    SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
                             "Couldn't Parse Stream Configuration");
                     return -1;
                 }
@@ -547,11 +852,8 @@ int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
             hStat.u.usageData_v0.streamid =
                     (uint8_t) stream_config[instance_cnt].stream_id;
 
-            if ((status = NT_StatRead(hStatStream, &hStat)) != NT_SUCCESS) {
-                /* Get the status code as text */
-                NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-                SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                        "NT_StatRead() failed: %s\n", error_buffer);
+            if ((status = NT_StatRead(hstat_stream, &hStat)) != NT_SUCCESS) {
+        		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
                 return -1;
             }
 
@@ -563,17 +865,13 @@ int NapatechGetStreamConfig(NapatechStreamConfig stream_config[])
     }
 
     /* Close the statistics stream */
-    if ((status = NT_StatClose(hStatStream)) != NT_SUCCESS) {
-        /* Get the status code as text */
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-        SCLogError(SC_ERR_RUNMODE, "NT_StatClose() failed: %s\n", error_buffer);
+    if ((status = NT_StatClose(hstat_stream)) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         return -1;
     }
 
     if ((status = NT_InfoClose(info_stream)) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED,
-                "NT_InfoClose failed: %s", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         return -1;
     }
 
@@ -587,16 +885,16 @@ static void *NapatechBufMonitorLoop(void *arg)
     NtInfo_t hStreamInfo;
     NtStatistics_t hStat; // Stat handle.
     NtInfoStream_t hInfo;
-    NtStatStream_t hStatStream;
-
-    char error_buffer[NT_ERRBUF_SIZE]; // Error buffer
+    NtStatStream_t hstat_stream;
     int status; // Status variable
 
     const uint32_t alertInterval = 25;
 
+#ifndef NAPATECH_ENABLE_BYPASS
     uint32_t OB_fill_level[MAX_STREAMS] = {0};
     uint32_t OB_alert_level[MAX_STREAMS] = {0};
     uint32_t ave_OB_fill_level[MAX_STREAMS] = {0};
+#endif
 
     uint32_t HB_fill_level[MAX_STREAMS] = {0};
     uint32_t HB_alert_level[MAX_STREAMS] = {0};
@@ -604,26 +902,19 @@ static void *NapatechBufMonitorLoop(void *arg)
 
     /* Open the info and Statistics */
     if ((status = NT_InfoOpen(&hInfo, "InfoStream")) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                "NT_InfoOpen() failed: %s\n", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
 
-    if ((status = NT_StatOpen(&hStatStream, "StatsStream")) != NT_SUCCESS) {
-        /* Get the status code as text */
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-        SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                "NT_StatOpen() failed: %s\n", error_buffer);
+    if ((status = NT_StatOpen(&hstat_stream, "StatsStream")) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
 
     /* Read the info on all streams instantiated in the system */
     hStreamInfo.cmd = NT_INFO_CMD_READ_STREAM;
     if ((status = NT_InfoRead(hInfo, &hStreamInfo)) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                "NT_InfoRead() failed: %s\n", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
 
@@ -645,9 +936,7 @@ static void *NapatechBufMonitorLoop(void *arg)
         /* Read the info on all streams instantiated in the system */
         hStreamInfo.cmd = NT_INFO_CMD_READ_STREAM;
         if ((status = NT_InfoRead(hInfo, &hStreamInfo)) != NT_SUCCESS) {
-            NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-            SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                    "NT_InfoRead() failed: %s\n", error_buffer);
+    		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
             exit(EXIT_FAILURE);
         }
 
@@ -666,11 +955,8 @@ static void *NapatechBufMonitorLoop(void *arg)
                 hStat.cmd = NT_STATISTICS_READ_CMD_USAGE_DATA_V0;
                 hStat.u.usageData_v0.streamid = (uint8_t) stream_id;
 
-                if ((status = NT_StatRead(hStatStream, &hStat)) != NT_SUCCESS) {
-                    /* Get the status code as text */
-                    NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-                    SCLogError(SC_ERR_NAPATECH_INIT_FAILED,
-                            "NT_StatRead() failed: %s\n", error_buffer);
+                if ((status = NT_StatRead(hstat_stream, &hStat)) != NT_SUCCESS) {
+            		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
                     exit(EXIT_FAILURE);
                 }
 
@@ -681,13 +967,17 @@ static void *NapatechBufMonitorLoop(void *arg)
             } while (hStat.u.usageData_v0.data.numHostBufferUsed == 0);
 
             if (RegisteredStream(stream_id, num_registered, registered_streams)) {
+#ifndef NAPATECH_ENABLE_BYPASS
                 ave_OB_fill_level[stream_id] = 0;
+#endif
                 ave_HB_fill_level[stream_id] = 0;
 
                 for (uint32_t hb_count = 0;
                         hb_count < hStat.u.usageData_v0.data.numHostBufferUsed;
                         hb_count++) {
 
+#ifndef NAPATECH_ENABLE_BYPASS
+#if 0
                     OB_fill_level[hb_count] =
                             ((100 * hStat.u.usageData_v0.data.hb[hb_count].onboardBuffering.used) /
                             hStat.u.usageData_v0.data.hb[hb_count].onboardBuffering.size);
@@ -695,7 +985,8 @@ static void *NapatechBufMonitorLoop(void *arg)
                     if (OB_fill_level[hb_count] > 100) {
                         OB_fill_level[hb_count] = 100;
                     }
-
+#endif
+#endif
                     uint32_t bufSize = hStat.u.usageData_v0.data.hb[hb_count].enQueuedAdapter / 1024
                             + hStat.u.usageData_v0.data.hb[hb_count].deQueued / 1024
                             + hStat.u.usageData_v0.data.hb[hb_count].enQueued / 1024
@@ -705,11 +996,16 @@ static void *NapatechBufMonitorLoop(void *arg)
                             ((100 * hStat.u.usageData_v0.data.hb[hb_count].deQueued / 1024) /
                             bufSize);
 
+#ifndef NAPATECH_ENABLE_BYPASS
                     ave_OB_fill_level[stream_id] += OB_fill_level[hb_count];
+#endif
                     ave_HB_fill_level[stream_id] += HB_fill_level[hb_count];
                 }
 
+#ifndef NAPATECH_ENABLE_BYPASS
                 ave_OB_fill_level[stream_id] /= hStat.u.usageData_v0.data.numHostBufferUsed;
+#endif
+
                 ave_HB_fill_level[stream_id] /= hStat.u.usageData_v0.data.numHostBufferUsed;
 
                 /* Host Buffer Fill Level warnings... */
@@ -737,6 +1033,7 @@ static void *NapatechBufMonitorLoop(void *arg)
                     }
                 }
 
+#ifndef NAPATECH_ENABLE_BYPASS               
                 /* On Board SDRAM Fill Level warnings... */
                 if (ave_OB_fill_level[stream_id] >= (OB_alert_level[stream_id] + alertInterval)) {
                     while (ave_OB_fill_level[stream_id] >= OB_alert_level[stream_id] + alertInterval) {
@@ -759,22 +1056,20 @@ static void *NapatechBufMonitorLoop(void *arg)
                         }
                     }
                 }
+#endif                
             }
             ++stream_id;
         }
     }
 
     if ((status = NT_InfoClose(hInfo)) != NT_SUCCESS) {
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer) - 1);
-        SCLogError(SC_ERR_NAPATECH_INIT_FAILED, "NT_InfoClose() failed: %s\n", error_buffer);
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
 
     /* Close the statistics stream */
-    if ((status = NT_StatClose(hStatStream)) != NT_SUCCESS) {
-        /* Get the status code as text */
-        NT_ExplainError(status, error_buffer, sizeof (error_buffer));
-        SCLogError(SC_ERR_NAPATECH_INIT_FAILED, "NT_StatClose() failed: %s\n", error_buffer);
+    if ((status = NT_StatClose(hstat_stream)) != NT_SUCCESS) {
+		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
 
@@ -785,6 +1080,7 @@ static void *NapatechBufMonitorLoop(void *arg)
 
     return NULL;
 }
+
 
 void NapatechStartStats(void)
 {
@@ -805,6 +1101,29 @@ void NapatechStartStats(void)
                 "Failed to spawn thread for NapatechStats - Killing engine.");
         exit(EXIT_FAILURE);
     }
+
+#ifdef NAPATECH_ENABLE_BYPASS
+    SCLogInfo("Napatech bypass functionality enabled.");
+
+    /* Creates the Statistic threads */
+    ThreadVars *flowinfo_tv = TmThreadCreate("NapatechFlowInfo",
+            NULL, NULL,
+            NULL, NULL,
+            "custom", NapatechFlowInfoLoop, 0);
+
+    if (flowinfo_tv == NULL) {
+        SCLogError(SC_ERR_THREAD_CREATE,
+                "Error creating a thread for NapatechFlowInfo - Killing engine.");
+        exit(EXIT_FAILURE);
+    }
+
+    if (TmThreadSpawn(flowinfo_tv) != 0) {
+        SCLogError(SC_ERR_THREAD_SPAWN,
+                "Failed to spawn thread for NapatechFlowInfo - Killing engine.");
+        exit(EXIT_FAILURE);
+    }
+
+#endif
 
     ThreadVars *buf_monitor_tv = TmThreadCreate("NapatechBufMonitor",
             NULL, NULL,
@@ -838,7 +1157,6 @@ bool NapatechSetupNuma(uint32_t stream, uint32_t numa)
     NtNtplInfo_t ntpl_info;
 
     if ((status = NT_ConfigOpen(&hconfig, "ConfigStream")) != NT_SUCCESS) {
-
         NAPATECH_ERROR(SC_ERR_NAPATECH_STREAMS_REGISTER_FAILED, status);
         return false;
     }
@@ -890,13 +1208,13 @@ static bool NapatechSetHashmode(uint32_t *filter_id)
 static uint32_t GetStreamNUMAs(uint32_t stream_id, int stream_numas[])
 {
     NtStatistics_t hStat; // Stat handle.
-    NtStatStream_t hStatStream;
+    NtStatStream_t hstat_stream;
     int status; // Status variable
 
     for (int i = 0; i < MAX_HOSTBUFFERS; ++i)
         stream_numas[i] = -1;
 
-    if ((status = NT_StatOpen(&hStatStream, "StatsStream")) != NT_SUCCESS) {
+    if ((status = NT_StatOpen(&hstat_stream, "StatsStream")) != NT_SUCCESS) {
         NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
@@ -909,7 +1227,7 @@ static uint32_t GetStreamNUMAs(uint32_t stream_id, int stream_numas[])
     hStat.cmd = NT_STATISTICS_READ_CMD_USAGE_DATA_V0;
     hStat.u.usageData_v0.streamid = (uint8_t) stream_id;
 
-    if ((status = NT_StatRead(hStatStream, &hStat)) != NT_SUCCESS) {
+    if ((status = NT_StatRead(hstat_stream, &hStat)) != NT_SUCCESS) {
         NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
@@ -921,8 +1239,29 @@ static uint32_t GetStreamNUMAs(uint32_t stream_id, int stream_numas[])
     return hStat.u.usageData_v0.data.numHostBufferUsed;
 }
 
+static int NapatechSetFilter(NtConfigStream_t hconfig, char *ntpl_cmd)
+{
+    int status = 0;
+    uint32_t filter_id = 0;
+
+    NtNtplInfo_t ntpl_info;
+    if ((status = NT_NTPL(hconfig, ntpl_cmd, &ntpl_info,
+            NT_NTPL_PARSER_VALIDATE_NORMAL)) == NT_SUCCESS) {
+        filter_id = ntpl_info.ntplId;
+        status = ntpl_info.u.errorData.errCode;
+        SCLogInfo("NTPL filter assignment \"%s\" returned filter id %4d",
+                ntpl_cmd, filter_id);
+    } else {
+        NAPATECH_NTPL_ERROR(ntpl_cmd, ntpl_info, status);
+        status = ntpl_info.u.errorData.errCode;
+        exit(EXIT_FAILURE);
+    }
+
+    return filter_id;
+}
+
 uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream,
-        uint32_t *filter_id, uint32_t *hash_id)
+        uint32_t filter_id[], uint32_t *hash_id)
 {
 #define PORTS_SPEC_SIZE 64
 
@@ -930,13 +1269,14 @@ uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream,
     ConfNode *ntports;
     bool first_iteration = true;
     int status = 0;
-    static NtConfigStream_t hconfig;
-    char ntpl_cmd[128];
+    NtConfigStream_t hconfig;
+    char ntpl_cmd[512];
+    int filter_cnt = 0;
 
     NapatechSetHashmode(hash_id);
 
-    /* When not using the default streams we need to parse
-     * the array of streams from the conf
+    /* When not using the default streams we need to parse 
+     * the array of streams from the conf 
      */
     if ((ntports = ConfGetNode("napatech.ports")) == NULL) {
         SCLogError(SC_ERR_RUNMODE, "Failed retrieving napatech.ports from Conf");
@@ -966,7 +1306,7 @@ uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream,
             }
             stream_spec = CONFIG_SPECIFIER_RANGE;
 
-            snprintf(ports_spec, sizeof(ports_spec), "all");
+            snprintf(ports_spec, sizeof (ports_spec), "all");
         } else if (strchr(port->val, '-')) {
             /* check that the sting in the config file is correctly specified */
             if (stream_spec != CONFIG_SPECIFIER_UNDEFINED) {
@@ -977,11 +1317,11 @@ uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream,
             stream_spec = CONFIG_SPECIFIER_RANGE;
 
             char copystr[16];
-            strlcpy(copystr, port->val, sizeof(copystr));
+            strlcpy(copystr, port->val, sizeof (copystr));
 
             start = atoi(copystr);
             end = atoi(strchr(copystr, '-') + 1);
-            snprintf(ports_spec, sizeof(ports_spec), "port == (%d..%d)", start, end);
+            snprintf(ports_spec, sizeof (ports_spec), "port == (%d..%d)", start, end);
 
         } else {
             /* check that the sting in the config file is correctly specified */
@@ -994,38 +1334,124 @@ uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream,
 
             /* Determine the ports to use on the NTPL assign statement*/
             if (first_iteration) {
-                snprintf(ports_spec, sizeof(ports_spec), "port==%s", port->val);
+                snprintf(ports_spec, sizeof (ports_spec), "port==%s", port->val);
                 first_iteration = false;
             } else {
                 char temp[PORTS_SPEC_SIZE];
-                snprintf(temp, sizeof(temp), "%s,%s",ports_spec,port->val);
-                snprintf(ports_spec, sizeof(ports_spec), "%s", temp);
+                snprintf(temp, sizeof (temp), "%s,%s", ports_spec, port->val);
+                snprintf(ports_spec, sizeof (ports_spec), "%s", temp);
             }
         }
     }
-
-    /* Build the NTPL command */
-    snprintf(ntpl_cmd, sizeof(ntpl_cmd), "assign[streamid=(%d..%d)] = %s",
-            first_stream, last_stream, ports_spec);
-
-    NtNtplInfo_t ntpl_info;
 
     if ((status = NT_ConfigOpen(&hconfig, "ConfigStream")) != NT_SUCCESS) {
         NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
         exit(EXIT_FAILURE);
     }
+ 
+#ifdef NAPATECH_ENABLE_BYPASS  
+    /* Build the NTPL command */
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[priority=10;Descriptor=DYN3,length=24,colorbits=32,Offset0=Layer3Header[0],Offset1=Layer4Header[0];streamid=(%d..%d);"
+    		"colormask=0x1]= %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
 
-    if ((status = NT_NTPL(hconfig, ntpl_cmd, &ntpl_info,
-            NT_NTPL_PARSER_VALIDATE_NORMAL)) == NT_SUCCESS) {
-        *filter_id = ntpl_info.ntplId;
-        status = ntpl_info.u.errorData.errCode;
-        SCLogInfo("NTPL filter assignment \"%s\" returned filter id %4d",
-                ntpl_cmd, *filter_id);
-    } else {
-        NAPATECH_NTPL_ERROR(ntpl_cmd, ntpl_info, status);
-        status = ntpl_info.u.errorData.errCode;
-        return false;
-    }
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[priority=10;Descriptor=DYN3,length=24,colorbits=32,Offset0=Layer3Header[0],Offset1=Layer4Header[0];streamid=(%d..%d);"
+    		"colormask=0x11;Hash=HashWord0_3=Layer3Header[12]/32,HashWord4_7=Layer3Header[16]/32,"
+    		"HashWord8=Layer4Header[0]/32,HashWordP=IpProtocol,XOR=true]=(Layer3Protocol==IPV4) and %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[priority=10;Descriptor=DYN3,length=24,colorbits=32,Offset0=Layer3Header[0],Offset1=Layer4Header[0];streamid=(%d..%d);"
+            "colormask=0x41;Hash=HashWord0_3=Layer3Header[12]/32,HashWord4_7=Layer3Header[16]/32,"
+    		"HashWord8=Layer4Header[0]/32,HashWordP=IpProtocol,XOR=true]=(Layer3Protocol==IPV6) and %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[priority=10;Descriptor=DYN3,length=24,colorbits=32,Offset0=Layer3Header[0],Offset1=Layer4Header[0];streamid=(%d..%d);"
+            "colormask=0x201;Hash=HashWord0_3=Layer3Header[12]/32,HashWord4_7=Layer3Header[16]/32,"
+            "HashWord8=Layer4Header[0]/32,HashWordP=IpProtocol,XOR=true]=(Layer4Protocol==UDP) and %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[priority=10;Descriptor=DYN3,length=24,colorbits=32,Offset0=Layer3Header[0],Offset1=Layer4Header[0];streamid=(%d..%d);"
+            "colormask=0x101;Hash=HashWord0_3=Layer3Header[12]/32,HashWord4_7=Layer3Header[16]/32,"
+            "HashWord8=Layer4Header[0]/32,HashWordP=IpProtocol,XOR=true]=(Layer4Protocol==TCP) and %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[priority=10;Descriptor=DYN3,length=24,colorbits=32,Offset0=Layer3Header[0],Offset1=Layer4Header[0];streamid=(%d..%d);"
+            "colormask=0x401;Hash=HashWord0_3=Layer3Header[12]/32,HashWord4_7=Layer3Header[16]/32,"
+            "HashWord8=Layer4Header[0]/32,HashWordP=IpProtocol,XOR=true]=(Layer4Protocol==SCTP) and %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "KeyType[name=KT%u;Access=partial;Bank=0]={32,32,16,16}",
+            NAPATECH_KEY_IPV4);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "KeyDef[name=KDEF%u;KeyType=KT%u;prot=OUTER]=(Layer3Header[12]/32,Layer3Header[16]/32,Layer4Header[0]/16,Layer4Header[2]/16)",
+            NAPATECH_KEY_IPV4, NAPATECH_KEY_IPV4);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[streamid=drop;priority=1]=(Layer3Protocol==IPV4)and(%s)and(Key(KDEF%u,KeyID=%u)==%u)",
+            ports_spec,
+            NAPATECH_KEY_IPV4,
+            NAPATECH_KEY_IPV4,
+            NAPATECH_KEY_IPV4);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[streamid=drop;priority=1]=(Layer3Protocol==IPV4)and(%s)and(Key(KDEF%u,KeyID=%u)==%u)",
+            ports_spec,
+            NAPATECH_KEY_IPV4,
+            NAPATECH_KEY_IPV4,
+			NAPATECH_KEY_DROP);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[streamid=drop;DestinationPort=1;priority=1]=(Layer3Protocol==IPV4)and(%s)and(Key(KDEF%u,KeyID=%u)==%u)",
+            ports_spec,
+            NAPATECH_KEY_IPV4,
+            NAPATECH_KEY_IPV4,
+			NAPATECH_KEY_PASS);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    // IPv6 5tuple
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "KeyType[name=KT%u;Access=partial;Bank=0]={128,128,16,16}",
+            NAPATECH_KEY_IPV6);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "KeyDef[name=KDEF%u;KeyType=KT%u;prot=OUTER]=(Layer3Header[8]/128,Layer3Header[24]/128,Layer4Header[0]/16,Layer4Header[2]/16)",
+            NAPATECH_KEY_IPV6, NAPATECH_KEY_IPV6);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd),
+            "assign[streamid=drop; priority=1]=(Layer3Protocol==IPV6)and(%s)and(Key(KDEF%u,KeyID=%u)==%u)",
+            ports_spec,
+            NAPATECH_KEY_IPV6,
+            NAPATECH_KEY_IPV6,
+            NAPATECH_KEY_IPV6);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+    
+#else
+    snprintf(ntpl_cmd, sizeof (ntpl_cmd), "assign[streamid=(%d..%d)] = %s",
+            first_stream, last_stream, ports_spec);
+    filter_id[filter_cnt++] = NapatechSetFilter(hconfig, ntpl_cmd);
+
+#endif
 
     SCLogInfo("Host-buffer NUMA assignments: ");
     int numa_nodes[MAX_HOSTBUFFERS];
@@ -1045,6 +1471,8 @@ uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream,
 
         SCLogInfo("%s", temp1);
     }
+
+    NT_ConfigClose(hconfig);
 
     return status;
 }
@@ -1072,6 +1500,8 @@ bool NapatechDeleteFilter(uint32_t filter_id)
         NAPATECH_NTPL_ERROR(ntpl_cmd, ntpl_info, status);
         status = 0;
     }
+
+    NT_ConfigClose(hconfig);
 
     return status;
 }
