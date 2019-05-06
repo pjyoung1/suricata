@@ -130,6 +130,13 @@ TimeSyncReferencePriority. To do this make the following changes to ntservice.in
 
     HostBuffersRx = [4,16,-1] # [number of host buffers, Size(MB), NUMA node]
     TimeSyncReferencePriority = OSTime	# Timestamp clock synchronized to the OS
+    
+If the system has multiple NUMA nodes you should allocate enough host buffers on 
+each NUMA equal to the number of streams in use. E.g. if you are using four streams
+on a system with two NUMA's:
+
+    HostBuffersRx = [4,16,0],[4,16,1] # [number of host buffers, Size(MB), NUMA node]
+
 
 Stop and restart ntservice after making changes to ntservice::
 
