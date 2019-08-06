@@ -2010,6 +2010,10 @@
         fi
 
         AC_DEFINE([HAVE_NAPATECH],[1],(Napatech capture card support))
+        AC_CHECK_LIB(ntapi, NT_FlowOpenAttrInit,NTFLOW="yes",NTFLOW="no")
+        if test "$NTFLOW" = "yes"; then
+            AC_DEFINE([NAPATECH_ENABLE_BYPASS],[1],(Napatech flowdirector support))
+        fi
     fi
 
   # liblua
