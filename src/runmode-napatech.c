@@ -40,6 +40,8 @@
 #define NT_RUNMODE_AUTOFP  1
 #define NT_RUNMODE_WORKERS 2
 
+static const char *default_mode = "workers";
+
 #ifdef HAVE_NAPATECH
 
 #define MAX_STREAMS 256
@@ -72,7 +74,7 @@ bool NapatechIsAutoConfigEnabled(void)
 
 const char *RunModeNapatechGetDefaultMode(void)
 {
-    return "workers";
+    return default_mode;
 }
 
 void RunModeNapatechRegister(void)
@@ -217,6 +219,10 @@ static int NapatechInit(int runmode)
     if ((ConfGetInt("napatech.hba", &conf->hba) != 0) && (conf->hba > 0)) {
         SCLogInfo("Host Buffer Allowance: %d", (int) conf->hba);
     }
+
+#ifdef NAPATECH_ENABLE_BYPASS
+    NapatechInitFlowStreams();
+#endif
 
     /* Start a thread to process the statistics */
     NapatechStartStats();
