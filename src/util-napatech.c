@@ -518,9 +518,10 @@ static void *NapatechStatsLoop(void *arg)
     }
 
     PacketCounters totalCounters;
-    totalCounters.pkts = StatsRegisterCounter("nt.total_pkts", tv);
-    totalCounters.byte = StatsRegisterCounter("nt.total_byte", tv);
-    totalCounters.drop = StatsRegisterCounter("nt.total_drop", tv);
+    totalCounters.pkts = StatsRegisterCounter("napa_total.pkts", tv);
+    totalCounters.byte = StatsRegisterCounter("napa_total.byte", tv);
+    totalCounters.drop = StatsRegisterCounter("napa_total.drop", tv);
+
 
     PacketCounters streamCounters[MAX_STREAMS];
     for (int i = 0; i < stream_cnt; ++i) {
@@ -531,7 +532,7 @@ static void *NapatechStatsLoop(void *arg)
             exit(EXIT_FAILURE);
         }
 
-        snprintf(pkts_buf, 32, "nt%d.pkts", stream_config[i].stream_id);
+        snprintf(pkts_buf, 32, "napa%d.pkts", stream_config[i].stream_id);
         streamCounters[i].pkts = StatsRegisterCounter(pkts_buf, tv);
 
         char *byte_buf = SCCalloc(1, 32);
@@ -540,7 +541,7 @@ static void *NapatechStatsLoop(void *arg)
                     "Failed to allocate memory for NAPATECH stream counter.");
             exit(EXIT_FAILURE);
         }
-        snprintf(byte_buf, 32, "nt%d.bytes", stream_config[i].stream_id);
+        snprintf(byte_buf, 32, "napa%d.bytes", stream_config[i].stream_id);
         streamCounters[i].byte = StatsRegisterCounter(byte_buf, tv);
 
         char *drop_buf = SCCalloc(1, 32);
@@ -549,14 +550,14 @@ static void *NapatechStatsLoop(void *arg)
                     "Failed to allocate memory for NAPATECH stream counter.");
             exit(EXIT_FAILURE);
         }
-        snprintf(drop_buf, 32, "nt%d.drop", stream_config[i].stream_id);
+        snprintf(drop_buf, 32, "napa%d.drop", stream_config[i].stream_id);
         streamCounters[i].drop = StatsRegisterCounter(drop_buf, tv);
     }
 
 #ifdef NAPATECH_ENABLE_BYPASS
     FlowStatsCounters flow_counters;
-	flow_counters.active_bypass_flows = StatsRegisterCounter("nt_bypass.active_flows", tv);
-	flow_counters.total_bypass_flows = StatsRegisterCounter("nt_bypass.total_flows", tv);
+	flow_counters.active_bypass_flows = StatsRegisterCounter("napa_bypass.active_flows", tv);
+	flow_counters.total_bypass_flows = StatsRegisterCounter("napa_bypass.total_flows", tv);
 #endif
 
     StatsSetupPrivate(tv);
