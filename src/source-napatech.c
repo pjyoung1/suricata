@@ -316,6 +316,7 @@ static int NapatechBypassCallback(Packet *p)
 	int status;
 	NtFlow_t flowMatch;
 
+//	printf("NapatechBypassCallback()\n");
 	NapatechPacketVars *ntpv = &(p->ntpv);
 	uint32_t packetType = ((ntpv->dyn3->color_hi << 14) & 0xFFFFC000) | ntpv->dyn3->color_lo;
 	uint8_t *packet = (uint8_t *) ntpv->dyn3 + ntpv->dyn3->descrLength;
@@ -692,7 +693,7 @@ TmEcode NapatechPacketLoop(ThreadVars *tv, void *data, void *slot) {
 			NAPATECH_ERROR(SC_ERR_NAPATECH_OPEN_FAILED, status);
 			SCLogInfo("Failed to read from Napatech Stream %d: %s",
 					ntv->stream_id, error_buffer);
-			SCReturnInt(TM_ECODE_FAILED);
+			//SCReturnInt(TM_ECODE_FAILED);
 		}
 
 		Packet *p = PacketGetFromQueueOrAlloc();
