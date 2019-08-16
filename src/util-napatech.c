@@ -91,6 +91,7 @@ static int getNumAdapters(void) {
     return num_adapters;
 }
 
+
 /**
  * \brief  Initializes the FlowStreams used to program flow data.
  *
@@ -112,8 +113,8 @@ int NapatechInitFlowStreams(void)
 		char flow_name[80];
 
 		NT_FlowOpenAttrInit(&attr);
+		//NT_FlowOpenAttrSetFlags(&attr,  NT_FLOW_STREAM_WR );
 		NT_FlowOpenAttrSetAdapterNo(&attr, adapter);
-        NT_FlowOpenAttrSetFlags(&attr, NT_FLOW_STREAM_WR);
 
         snprintf(flow_name, sizeof(flow_name), "Flow stream %d", adapter );
         if ((status = NT_FlowOpen_Attr(&hFlowStream[adapter], flow_name, &attr)) != NT_SUCCESS) {
@@ -225,16 +226,16 @@ static void *NapatechFlowInfoLoop(void *arg)
 	uint32_t adapter = 0; //_get_adapter(*port);
 
     FlowInfoCounters flowinfo_counters;
-    flowinfo_counters.packets = StatsRegisterCounter("nt_bypass.pkts", tv);
-    flowinfo_counters.bytes = StatsRegisterCounter("nt_bypass.bytes", tv);
-    flowinfo_counters.to = StatsRegisterCounter("nt_bypass.to", tv);
-    flowinfo_counters.fin = StatsRegisterCounter("nt_bypass.fin", tv);
+    flowinfo_counters.packets = StatsRegisterCounter("napa_bypass.pkts", tv);
+    flowinfo_counters.bytes = StatsRegisterCounter("napa_bypass.bytes", tv);
+    flowinfo_counters.to = StatsRegisterCounter("napa_bypass.to", tv);
+    flowinfo_counters.fin = StatsRegisterCounter("napa_bypass.fin", tv);
 
     StatsSetupPrivate(tv);
 
 	NT_FlowOpenAttrInit(&attr);
+	//NT_FlowOpenAttrSetFlags(&attr,  NT_FLOW_STREAM_RD );
 	NT_FlowOpenAttrSetAdapterNo(&attr, adapter);
-	NT_FlowOpenAttrSetFlags(&attr, NT_FLOW_STREAM_RD);
 
 	if ((status = NT_FlowOpen_Attr(&hFlowStream, "FlowInfo stream", &attr)) != NT_SUCCESS) {
 		NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
@@ -260,10 +261,15 @@ static void *NapatechFlowInfoLoop(void *arg)
 				default:
 					break;
 			}
+			if (pkt_cnt > 0) {
+				printf("flow_read pkt_cnt: %lu\n", pkt_cnt);
+			}
 
 		} else {
 			if (status != NT_STATUS_TIMEOUT) {
 				NAPATECH_ERROR(SC_ERR_NAPATECH_INIT_FAILED, status);
+			} else {
+				//printf("flow_read timeout\n");
 			}
 		}
 
@@ -297,12 +303,13 @@ static void *NapatechFlowInfoLoop(void *arg)
  * Statistics code
  *-----------------------------------------------------------------------------
  */
-typedef struct StreamCounters_ {
+typedef struct PacketCounters_ {
     uint16_t pkts;
     uint16_t byte;
     uint16_t drop;
-} StreamCounters;
+} PacketCounters;
 
+NapatechCurrentStats total_stats;
 NapatechCurrentStats current_stats[MAX_STREAMS];
 
 NapatechCurrentStats NapatechGetCurrentStats(uint16_t id)
@@ -381,7 +388,8 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
         NtStatStream_t hstat_stream,
         uint16_t num_streams,
         NapatechStreamConfig stream_config[],
-        StreamCounters streamCounters[]
+		PacketCounters totalCounters,
+		PacketCounters streamCounters[]
         )
 {
     static uint64_t rxPktsStart[MAX_STREAMS] = {0};
@@ -452,7 +460,7 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
             current_stats[stream_id].current_packets = rxPktsTotal - rxPktsStart[stream_id];
             current_stats[stream_id].current_bytes = rxByteTotal - rxByteStart[stream_id];
             current_stats[stream_id].current_drops = dropTotal - dropStart[stream_id];
-        }
+       }
 
         StatsSetUI64(tv, streamCounters[inst_id].pkts, current_stats[stream_id].current_packets);
         StatsSetUI64(tv, streamCounters[inst_id].byte, current_stats[stream_id].current_bytes);
@@ -460,6 +468,22 @@ static uint32_t UpdateStreamStats(ThreadVars *tv,
 
         ++inst_id;
     }
+
+    uint32_t stream_id;
+    for (stream_id = 0; stream_id < num_streams; ++stream_id) {
+        total_stats.current_packets += current_stats[stream_id].current_packets;
+        total_stats.current_bytes += current_stats[stream_id].current_bytes;
+        total_stats.current_drops += current_stats[stream_id].current_drops;
+    }
+
+    StatsSetUI64(tv, totalCounters.pkts, total_stats.current_packets);
+    StatsSetUI64(tv, totalCounters.byte, total_stats.current_bytes);
+    StatsSetUI64(tv, totalCounters.drop, total_stats.current_drops);
+
+    total_stats.current_packets = 0;
+    total_stats.current_bytes = 0;
+    total_stats.current_drops = 0;
+
     return num_active;
 }
 
@@ -493,7 +517,12 @@ static void *NapatechStatsLoop(void *arg)
         return NULL;
     }
 
-    StreamCounters streamCounters[MAX_STREAMS];
+    PacketCounters totalCounters;
+    totalCounters.pkts = StatsRegisterCounter("nt.total_pkts", tv);
+    totalCounters.byte = StatsRegisterCounter("nt.total_byte", tv);
+    totalCounters.drop = StatsRegisterCounter("nt.total_drop", tv);
+
+    PacketCounters streamCounters[MAX_STREAMS];
     for (int i = 0; i < stream_cnt; ++i) {
         char *pkts_buf = SCCalloc(1, 32);
         if (unlikely(pkts_buf == NULL)) {
@@ -532,6 +561,11 @@ static void *NapatechStatsLoop(void *arg)
 
     StatsSetupPrivate(tv);
 
+    StatsSetUI64(tv, totalCounters.pkts, 0);
+    StatsSetUI64(tv, totalCounters.byte, 0);
+    StatsSetUI64(tv, totalCounters.drop, 0);
+
+
     for (int i = 0; i < stream_cnt; ++i) {
         StatsSetUI64(tv, streamCounters[i].pkts, 0);
         StatsSetUI64(tv, streamCounters[i].byte, 0);
@@ -545,7 +579,7 @@ static void *NapatechStatsLoop(void *arg)
 #endif
 
     uint32_t num_active = UpdateStreamStats(tv, hInfo, hstat_stream,
-            stream_cnt, stream_config, streamCounters);
+            stream_cnt, stream_config, totalCounters, streamCounters);
 
     if (!NapatechIsAutoConfigEnabled() && (num_active < stream_cnt)) {
         SCLogInfo("num_active: %d,  stream_cnt: %d", num_active, stream_cnt);
@@ -561,7 +595,7 @@ static void *NapatechStatsLoop(void *arg)
         }
 
         UpdateStreamStats(tv, hInfo, hstat_stream,
-                stream_cnt, stream_config, streamCounters);
+                stream_cnt, stream_config, totalCounters, streamCounters);
 
 #ifdef NAPATECH_ENABLE_BYPASS
         UpdateFlowStats(tv, hInfo, hstat_stream, flow_counters, 0);
@@ -1377,6 +1411,7 @@ uint32_t NapatechSetupTraffic(uint32_t first_stream, uint32_t last_stream)
         exit(EXIT_FAILURE);
     }
  
+
 #ifdef NAPATECH_ENABLE_BYPASS  
     /* Build the NTPL command */
     snprintf(ntpl_cmd, sizeof (ntpl_cmd),
